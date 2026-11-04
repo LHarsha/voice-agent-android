@@ -88,6 +88,28 @@ public final class WebSkills {
         return r.length() > 450 ? r.substring(0, 450) + "…" : r;
     }
 
+    // ------------------------------------------------------------------ DuckDuckGo instant answers
+
+    /** Direct answers for quick facts ("how tall is mount everest"), or null. Free, no key. */
+    public static String instantAnswer(String question) throws IOException {
+        try {
+            JSONObject o = new JSONObject(get("https://api.duckduckgo.com/?format=json&no_html=1&skip_disambig=1&t=voiceagent&q="
+                    + enc(question)));
+            Object answer = o.opt("Answer");
+            if (answer instanceof String && !((String) answer).trim().isEmpty()
+                    && !"calc".equals(o.optString("AnswerType"))) {
+                return ((String) answer).trim();
+            }
+            String abs = o.optString("AbstractText", "").trim();
+            if (!abs.isEmpty()) return firstSentences(abs, 2);
+            String def = o.optString("Definition", "").trim();
+            if (!def.isEmpty()) return def;
+            return null;
+        } catch (org.json.JSONException e) {
+            return null;
+        }
+    }
+
     // ------------------------------------------------------------------ Dictionary
 
     public static String define(String word) throws IOException {

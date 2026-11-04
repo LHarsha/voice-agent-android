@@ -54,7 +54,10 @@ public final class TimeParser {
     public static String normalize(String s) {
         s = s.toLowerCase();
         s = s.replaceAll("a\\.\\s?m\\.?", "am").replaceAll("p\\.\\s?m\\.?", "pm");
+        s = s.replaceAll("\\b(\\d{1,2})(\\d{2})\\s*(am|pm)\\b", "$1:$2 $3");       // "730 am" -> "7:30 am"
         s = s.replaceAll("(\\d)\\s*(am|pm)\\b", "$1 $2");
+        s = s.replaceAll("(\\d)-(minutes?|mins?|hours?|hrs?|seconds?|secs?|days?|weeks?)\\b", "$1 $2"); // "5-minute"
+        s = s.replaceAll("\\b(\\d+)(minutes?|mins?|hours?|hrs?|seconds?|secs?)\\b", "$1 $2");          // "10min"
         s = s.replaceAll("o'clock", "");
         return s;
     }

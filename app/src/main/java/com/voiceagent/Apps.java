@@ -43,6 +43,22 @@ public final class Apps {
         ALIASES.put("calculator", "calculator");
         ALIASES.put("clock", "clock");
         ALIASES.put("alarm", "clock");
+        ALIASES.put("notes", "samsung notes");
+        ALIASES.put("store", "galaxy store");
+        ALIASES.put("samsung store", "galaxy store");
+        ALIASES.put("health", "samsung health");
+        ALIASES.put("wallet", "samsung wallet");
+        ALIASES.put("contact", "contacts");
+        ALIASES.put("calender", "calendar");
+        ALIASES.put("you tube music", "youtube music");
+        ALIASES.put("yt music", "youtube music");
+        ALIASES.put("chrome browser", "chrome");
+        ALIASES.put("google chrome", "chrome");
+        ALIASES.put("whatsapp business", "wa business");
+        ALIASES.put("paytm app", "paytm");
+        ALIASES.put("snap", "snapchat");
+        ALIASES.put("tele gram", "telegram");
+        ALIASES.put("linked in", "linkedin");
     }
 
     public static final class Found {
@@ -74,9 +90,12 @@ public final class Apps {
             else if (l.startsWith(q + " ") || l.startsWith(q)) s = 80 - Math.min(20, l.length() - q.length());
             else if (l.contains(q)) s = 60;
             else if (q.length() >= 4 && q.contains(l) && l.length() >= 3) s = 55;
+            else if (q.length() >= 4 && ri.activityInfo.packageName.toLowerCase(Locale.ROOT).contains(q.replace(" ", ""))) s = 52;
             else {
                 double sim = similarity(q.replace(" ", ""), l.replace(" ", ""));
-                s = sim >= 0.7 ? sim * 50 : 0;
+                double simPh = similarity(Contacts.phonetic(q).replace(" ", ""), Contacts.phonetic(l).replace(" ", ""));
+                double top = Math.max(sim, simPh - 0.05);
+                s = top >= 0.7 ? top * 50 : 0;
             }
             if (s > bestScore) {
                 bestScore = s;

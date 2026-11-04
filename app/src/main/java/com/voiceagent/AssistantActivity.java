@@ -5,8 +5,10 @@ import android.app.Activity;
 import android.app.role.RoleManager;
 import android.content.ActivityNotFoundException;
 import android.content.Context;
+import android.content.ComponentName;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
@@ -16,10 +18,12 @@ import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
 import android.speech.RecognitionListener;
+import android.speech.RecognitionService;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
 import android.speech.tts.TextToSpeech;
 import android.speech.tts.UtteranceProgressListener;
+import android.telephony.TelephonyManager;
 import android.text.InputType;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -36,6 +40,7 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 
 import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 
 /**
@@ -108,6 +113,8 @@ public class AssistantActivity extends Activity implements Brain.Host {
         super.onNewIntent(intent);
         setIntent(intent);
         closeAfterSpeech = false;
+        silentRetries = 0;
+        engineSwitches = 0;
         startListening();
     }
 
@@ -120,6 +127,8 @@ public class AssistantActivity extends Activity implements Brain.Host {
     @Override
     protected void onStop() {
         super.onStop();
+        session++; // ignore late callbacks from the recognizer
+        ui.removeCallbacks(listenRunnable);
         if (recognizer != null) recognizer.cancel();
         if (orb.getState() == OrbView.State.LISTENING) setIdle(null);
     }
@@ -219,8 +228,13 @@ public class AssistantActivity extends Activity implements Brain.Host {
         orb = new OrbView(this);
         orb.setContentDescription("Talk");
         orb.setOnClickListener(v -> {
-            if (orb.getState() == OrbView.State.LISTENING && recognizer != null) recognizer.stopListening();
-            else startListening();
+            if (orb.getState() == OrbView.State.LISTENING && recognizer != null) {
+                recognizer.stopListening();
+            } else {
+                silentRetries = 0;
+                engineSwitches = 0;
+                startListening();
+            }
         });
         orbRow.addView(orb, new FrameLayout.LayoutParams(dp(120), dp(120), Gravity.CENTER));
         TextView kb = roundButton("⌨");
@@ -320,6 +334,8 @@ public class AssistantActivity extends Activity implements Brain.Host {
             imm.hideSoftInputFromWindow(input.getWindowToken(), 0);
             return;
         }
+        session++;
+        ui.removeCallbacks(listenRunnable);
         if (recognizer != null) recognizer.cancel();
         if (tts != null) tts.stop();
         setIdle("Type your request");
@@ -377,101 +393,300 @@ public class AssistantActivity extends Activity implements Brain.Host {
 
     // ------------------------------------------------------------------ listening
 
+    /** Speech engines to try, best first. A ComponentName, DEFAULT_ENGINE or ON_DEVICE_ENGINE. */
+    private static final String DEFAULT_ENGINE = "default";
+    private static final String ON_DEVICE_ENGINE = "on-device";
+    private final List<Object> engines = new ArrayList<>();
+    private int engineIndex;
+    private Object recognizerEngine;
+    private int session;
+    private String lastPartial;
+    private boolean heardSpeech;
+    private int silentRetries;
+    private int engineSwitches;
+    private static volatile ArrayList<String> biasWords;
+
+    private void buildEngineList() {
+        engines.clear();
+        PackageManager pm = getPackageManager();
+        List<ResolveInfo> services = pm.queryIntentServices(new Intent(RecognitionService.SERVICE_INTERFACE), 0);
+        // Google's recognizer is far more accurate than most phone defaults (often Bixby on Samsung).
+        String[] preferred = {"com.google.android.googlequicksearchbox", "com.google.android.tts"};
+        for (String pkg : preferred) {
+            for (ResolveInfo ri : services) {
+                if (ri.serviceInfo != null && pkg.equals(ri.serviceInfo.packageName)) {
+                    engines.add(new ComponentName(pkg, ri.serviceInfo.name));
+                    break;
+                }
+            }
+        }
+        engines.add(DEFAULT_ENGINE);
+        if (Build.VERSION.SDK_INT >= 31) {
+            try {
+                if (SpeechRecognizer.isOnDeviceRecognitionAvailable(this)) engines.add(ON_DEVICE_ENGINE);
+            } catch (RuntimeException ignored) {
+            }
+        }
+        // Start with whichever engine worked last time.
+        String last = getSharedPreferences("voice", MODE_PRIVATE).getString("engine", null);
+        engineIndex = 0;
+        for (int i = 0; i < engines.size(); i++) {
+            if (engineKey(engines.get(i)).equals(last)) engineIndex = i;
+        }
+    }
+
+    private static String engineKey(Object e) {
+        return e instanceof ComponentName ? ((ComponentName) e).flattenToString() : String.valueOf(e);
+    }
+
+    private SpeechRecognizer createRecognizer(Object engine) {
+        if (engine instanceof ComponentName) return SpeechRecognizer.createSpeechRecognizer(this, (ComponentName) engine);
+        if (ON_DEVICE_ENGINE.equals(engine) && Build.VERSION.SDK_INT >= 31) return SpeechRecognizer.createOnDeviceSpeechRecognizer(this);
+        return SpeechRecognizer.createSpeechRecognizer(this);
+    }
+
+    /** Indian English when the phone is in India: much better with Indian accents and names. */
+    private String recognitionLanguage() {
+        Locale loc = Locale.getDefault();
+        String sim = "";
+        try {
+            TelephonyManager tm = (TelephonyManager) getSystemService(Context.TELEPHONY_SERVICE);
+            if (tm != null && tm.getSimCountryIso() != null) sim = tm.getSimCountryIso().toUpperCase(Locale.ROOT);
+        } catch (RuntimeException ignored) {
+        }
+        boolean india = "IN".equals(sim) || "IN".equals(loc.getCountry());
+        if ("en".equals(loc.getLanguage())) return india ? "en-IN" : loc.toLanguageTag();
+        return india ? "en-IN" : "en-US";
+    }
+
+    /** Words to nudge the recognizer toward: command words plus your contacts' and apps' names. */
+    private void loadBiasWords() {
+        if (biasWords != null || Build.VERSION.SDK_INT < 33) return;
+        Context app = getApplicationContext();
+        new Thread(() -> {
+            java.util.LinkedHashSet<String> words = new java.util.LinkedHashSet<>(java.util.Arrays.asList(
+                    "call", "text", "message", "WhatsApp", "alarm", "timer", "remind me", "reminder", "weather",
+                    "open", "play", "pause", "flashlight", "torch", "navigate", "directions", "volume", "brightness",
+                    "Bluetooth", "Wi-Fi", "do not disturb", "selfie", "note", "calendar", "translate"));
+            try {
+                if (app.checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED) {
+                    try (android.database.Cursor c = app.getContentResolver().query(
+                            android.provider.ContactsContract.Contacts.CONTENT_URI,
+                            new String[]{android.provider.ContactsContract.Contacts.DISPLAY_NAME},
+                            android.provider.ContactsContract.Contacts.HAS_PHONE_NUMBER + "=1", null,
+                            android.provider.ContactsContract.Contacts.STARRED + " DESC")) {
+                        while (c != null && c.moveToNext() && words.size() < 75) {
+                            String n = c.getString(0);
+                            if (n != null && n.length() <= 40) words.add(n);
+                        }
+                    }
+                }
+                PackageManager pm = app.getPackageManager();
+                for (ResolveInfo ri : pm.queryIntentActivities(new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)) {
+                    if (words.size() >= 100) break;
+                    words.add(String.valueOf(ri.loadLabel(pm)));
+                }
+            } catch (RuntimeException ignored) {
+            }
+            biasWords = new ArrayList<>(words);
+        }).start();
+    }
+
     private void startListening() {
+        ui.removeCallbacks(listenRunnable);
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             status.setText("I need the microphone to hear you");
             requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_MIC);
             return;
         }
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            addBubble("Speech recognition isn't available. Install or update the \"Speech Recognition & Synthesis\" "
-                    + "or \"Google\" app from the Play Store, then try again. You can type in the meantime.", false);
+        if (engines.isEmpty()) buildEngineList();
+        if (!SpeechRecognizer.isRecognitionAvailable(this) && engines.size() <= 1) {
+            addBubble("Speech recognition isn't available. Install or update the \"Google\" app or "
+                    + "\"Speech Recognition & Synthesis\" from the Play Store, then try again. You can type in the meantime.", false);
             setIdle("Voice unavailable — tap ⌨ to type");
             return;
         }
+        loadBiasWords();
         if (tts != null) tts.stop();
         listenAfterSpeech = false;
         closeAfterSpeech = false;
-        if (recognizer != null) recognizer.destroy();
-        recognizer = SpeechRecognizer.createSpeechRecognizer(this);
-        recognizer.setRecognitionListener(listener);
+        lastPartial = null;
+        heardSpeech = false;
 
+        Object engine = engines.get(Math.min(engineIndex, engines.size() - 1));
+        if (recognizer == null || !engine.equals(recognizerEngine)) {
+            if (recognizer != null) recognizer.destroy();
+            try {
+                recognizer = createRecognizer(engine);
+            } catch (RuntimeException e) {
+                recognizer = null;
+            }
+            recognizerEngine = engine;
+        } else {
+            recognizer.cancel();
+        }
+        if (recognizer == null) {
+            if (switchEngine()) return;
+            setIdle("Couldn't start speech recognition — tap ⌨ to type");
+            return;
+        }
+        final int mySession = ++session;
+        recognizer.setRecognitionListener(new Listener(mySession));
+
+        String lang = recognitionLanguage();
         Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
         i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
         i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
-        i.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3);
+        i.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5);
         i.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, getPackageName());
-        Locale loc = Locale.getDefault();
-        String tag = "en".equals(loc.getLanguage()) ? loc.toLanguageTag() : "en-US";
-        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, tag);
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang);
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, lang);
+        // Give people time to finish their sentence instead of cutting them off at the first pause.
+        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1800L);
+        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L);
+        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 1500L);
+        if (Build.VERSION.SDK_INT >= 33 && biasWords != null) {
+            i.putStringArrayListExtra(RecognizerIntent.EXTRA_BIASING_STRINGS, biasWords);
+        }
         live.setText("");
-        status.setText("Listening…");
+        status.setText(silentRetries > 0 ? "Still listening…" : "Listening…");
         orb.setState(OrbView.State.LISTENING);
         try {
             recognizer.startListening(i);
         } catch (RuntimeException e) {
-            setIdle("Couldn't start the microphone — tap to retry");
+            if (!switchEngine()) setIdle("Couldn't start the microphone — tap to retry");
         }
     }
 
-    private final RecognitionListener listener = new RecognitionListener() {
-        @Override public void onReadyForSpeech(Bundle params) { status.setText("Listening…"); busyRetries = 0; }
-        @Override public void onBeginningOfSpeech() { }
-        @Override public void onRmsChanged(float rmsdB) { orb.setRms(rmsdB); }
+    private final Runnable listenRunnable = this::startListening;
+
+    /** Move to the next speech engine and try again. Returns false when there are none left. */
+    private boolean switchEngine() {
+        if (engineSwitches >= engines.size() - 1) return false;
+        engineSwitches++;
+        engineIndex = (engineIndex + 1) % engines.size();
+        if (recognizer != null) {
+            recognizer.destroy();
+            recognizer = null;
+        }
+        status.setText("Switching speech engine…");
+        ui.postDelayed(listenRunnable, 250);
+        return true;
+    }
+
+    /** Act on what was heard: the best of the recognizer's guesses. */
+    private void process(List<String> guesses) {
+        String best = null;
+        int bestScore = -1;
+        for (String g : guesses) {
+            if (g == null || g.trim().isEmpty()) continue;
+            int sc = Brain.score(g);
+            if (sc > bestScore) { // earlier guesses win ties: they're the recognizer's own favourites
+                bestScore = sc;
+                best = g.trim();
+            }
+        }
+        if (best == null) {
+            setIdle("I didn't catch that — tap to try again");
+            return;
+        }
+        silentRetries = 0;
+        engineSwitches = 0;
+        getSharedPreferences("voice", MODE_PRIVATE).edit()
+                .putString("engine", engineKey(engines.get(Math.min(engineIndex, engines.size() - 1)))).apply();
+        live.setText("");
+        status.setText("");
+        addBubble(best, true);
+        orb.setState(OrbView.State.THINKING);
+        brain.handle(best);
+    }
+
+    private final class Listener implements RecognitionListener {
+        private final int id;
+
+        Listener(int id) { this.id = id; }
+
+        private boolean stale() { return id != session || isFinishing() || isDestroyed(); }
+
+        @Override public void onReadyForSpeech(Bundle params) { if (!stale()) { status.setText(silentRetries > 0 ? "Still listening…" : "Listening…"); busyRetries = 0; } }
+        @Override public void onBeginningOfSpeech() { heardSpeech = true; }
+        @Override public void onRmsChanged(float rmsdB) { if (!stale()) orb.setRms(rmsdB); }
         @Override public void onBufferReceived(byte[] buffer) { }
-        @Override public void onEndOfSpeech() { orb.setState(OrbView.State.THINKING); status.setText(""); }
+        @Override public void onEndOfSpeech() { if (!stale()) { orb.setState(OrbView.State.THINKING); status.setText(""); } }
         @Override public void onEvent(int eventType, Bundle params) { }
 
         @Override
         public void onPartialResults(Bundle partial) {
+            if (stale()) return;
             ArrayList<String> r = partial.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
-            if (r != null && !r.isEmpty() && !r.get(0).isEmpty()) live.setText(r.get(0));
+            if (r != null && !r.isEmpty() && r.get(0) != null && !r.get(0).trim().isEmpty()) {
+                lastPartial = r.get(0).trim();
+                live.setText(lastPartial);
+            }
         }
 
         @Override
         public void onResults(Bundle results) {
+            if (stale()) return;
             ArrayList<String> r = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
-            if (r == null || r.isEmpty() || r.get(0).trim().isEmpty()) {
-                setIdle("I didn't catch that — tap to try again");
+            List<String> guesses = new ArrayList<>();
+            if (r != null) guesses.addAll(r);
+            if (lastPartial != null) guesses.add(lastPartial);
+            boolean empty = true;
+            for (String g : guesses) if (g != null && !g.trim().isEmpty()) empty = false;
+            if (empty) {
+                onError(SpeechRecognizer.ERROR_NO_MATCH);
                 return;
             }
-            String heard = r.get(0).trim();
-            live.setText("");
-            status.setText("");
-            addBubble(heard, true);
-            orb.setState(OrbView.State.THINKING);
-            brain.handle(heard);
+            process(guesses);
         }
 
         @Override
         public void onError(int error) {
+            if (stale()) return;
+            // Many recognizers report an error even though they already heard you: use that text.
+            if (lastPartial != null && error != SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
+                List<String> g = new ArrayList<>();
+                g.add(lastPartial);
+                process(g);
+                return;
+            }
             switch (error) {
                 case SpeechRecognizer.ERROR_NO_MATCH:
                 case SpeechRecognizer.ERROR_SPEECH_TIMEOUT:
                     live.setText("");
-                    setIdle("I didn't catch that — tap to try again");
+                    if (silentRetries < 1 && !heardSpeech) {
+                        silentRetries++;
+                        ui.postDelayed(listenRunnable, 150);
+                    } else {
+                        silentRetries = 0;
+                        setIdle("I didn't catch that — tap the orb and try again");
+                    }
                     break;
                 case SpeechRecognizer.ERROR_RECOGNIZER_BUSY:
-                    if (busyRetries++ < 2) ui.postDelayed(AssistantActivity.this::startListening, 400);
-                    else setIdle("The microphone is busy — tap to retry");
-                    break;
-                case SpeechRecognizer.ERROR_NETWORK:
-                case SpeechRecognizer.ERROR_NETWORK_TIMEOUT:
-                case SpeechRecognizer.ERROR_SERVER:
-                    setIdle("No connection. Download offline speech in Settings to talk without internet.");
+                    if (busyRetries++ < 2) {
+                        if (recognizer != null) {
+                            recognizer.destroy();
+                            recognizer = null;
+                        }
+                        ui.postDelayed(listenRunnable, 500);
+                    } else if (!switchEngine()) {
+                        setIdle("The microphone is busy — tap to retry");
+                    }
                     break;
                 case SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS:
                     setIdle("Microphone permission is needed");
                     break;
-                case SpeechRecognizer.ERROR_CLIENT:
-                    // Happens after we cancel on purpose; stay quiet.
-                    if (orb.getState() == OrbView.State.LISTENING) setIdle(null);
+                case SpeechRecognizer.ERROR_NETWORK:
+                case SpeechRecognizer.ERROR_NETWORK_TIMEOUT:
+                    if (!switchEngine()) setIdle("No internet for speech. Download offline speech (see the README) or tap ⌨ to type.");
                     break;
                 default:
-                    setIdle("Something went wrong (" + error + ") — tap to retry");
+                    // Server errors, unsupported language, engine crashes: try the next engine.
+                    if (!switchEngine()) setIdle("Speech recognition failed (" + error + ") — tap to retry or ⌨ to type");
             }
         }
-    };
+    }
 
     // ------------------------------------------------------------------ speaking
 
@@ -500,7 +715,8 @@ public class AssistantActivity extends Activity implements Brain.Host {
         }
         if (listenAfterSpeech) {
             listenAfterSpeech = false;
-            startListening();
+            // A short pause so the mic doesn't catch the end of our own voice.
+            ui.postDelayed(listenRunnable, 300);
         } else if (orb.getState() != OrbView.State.LISTENING) {
             setIdle(null);
         }

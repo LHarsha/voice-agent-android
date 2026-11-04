@@ -111,8 +111,10 @@ public class Brain {
         raw = raw.trim();
         if (raw.isEmpty()) return;
         String s = normalize(raw);
+        String light = clean(raw);
+        if (s.isEmpty()) s = light;
 
-        if (s.matches("(cancel|stop|never ?mind|nothing|forget it|no thanks?|that's all|that is all|bye|goodbye|good bye|dismiss|close|exit|quit)")) {
+        if (s.matches("(cancel|stop|never ?mind|nothing|forget it|no thanks?|that's all|that is all|bye|goodbye|good bye|bye bye|dismiss|close|exit|quit|go away|shut up)")) {
             pending = Pending.NONE;
             host.close(s.contains("bye") ? "Bye!" : "Okay.");
             return;
@@ -121,7 +123,7 @@ public class Brain {
         if (pending != Pending.NONE && handlePending(s, raw)) return;
         pending = Pending.NONE;
 
-        if (smallTalk(s)) return;
+        if (smallTalk(light) || smallTalk(s)) return;
         if (timeAndDate(s)) return;
         if (!s.startsWith("play ") && device(s)) return;
         if (media(s)) return;
@@ -135,32 +137,119 @@ public class Brain {
         if (fun(s)) return;
         if (translate(s, raw)) return;
         if (weather(s)) return;
+        if (conversions(s)) return;
         if (openApp(s)) return;
         if (math(s)) return;
         if (knowledge(s)) return;
         webSearch(raw, "Here's what I found on the web.");
     }
 
-    static String normalize(String raw) {
+    /** Lowercase + strip punctuation the recognizer adds ("Okay, call Mom." -> "okay call mom"). */
+    static String clean(String raw) {
         String s = raw.toLowerCase(Locale.ROOT)
+                .replace("’", "'").replace("‘", "'")
                 .replaceAll("[“”\"]", "")
                 .replace("wi-fi", "wifi").replace("wi fi", "wifi")
-                .replace("’", "'")
                 .trim();
         s = TimeParser.normalize(s);
-        s = s.replaceAll("^(hey|ok|okay|hi|yo)\\s+(assistant|agent|voice agent|buddy)[,]?\\s*", "");
-        for (int i = 0; i < 2; i++) {
-            s = s.replaceAll("^(please|can you|could you|would you|will you|can u|i want you to|i'd like you to|i need you to|i want to|i'd like to|i need to|go ahead and|just)\\s+", "");
+        // Keep "7:30" and "2.5" but drop sentence punctuation everywhere else.
+        s = s.replaceAll("(?<!\\d)[.:]|[.:](?!\\d)", " ");
+        s = s.replaceAll("[,;!?¿¡…()\\[\\]]", " ");
+        s = s.replaceAll("(?<=\\s|^)-+|-+(?=\\s|$)", " ");
+        return s.replaceAll("\\s+", " ").trim();
+    }
+
+    private static final String LEADING_FILLER = "^(?:um+|uh+m*|erm|hmm+|so|well|okay|ok|alright|all right|hey|yeah|yes|please|kindly"
+            + "|can you|could you|would you|will you|can u|could u|would you mind|do you mind|i want you to|i'd like you to"
+            + "|i would like you to|i need you to|i want to|i wanna|i would like to|i'd like to|i need to|i have to|i gotta"
+            + "|go ahead and|just|quickly|quick|now|let's|lets|help me|try to|try and|and|also|then)\\s+";
+    private static final String TRAILING_FILLER = "\\s+(?:please|for me|right now|now|real quick|quickly|thanks|thank you"
+            + "|okay|ok|immediately|asap|right away|will you|can you|could you|if you can|for me please)$";
+
+    static String normalize(String raw) {
+        String s = clean(raw);
+        // Wake words people say out of habit: "hey google", "ok siri", "alexa", ...
+        s = s.replaceAll("^(?:(?:hey|hi|ok|okay|yo|hello)\\s+)?(?:google|siri|alexa|bixby|assistant|agent|voice agent|jarvis)\\b\\s*", "");
+        String prev;
+        do {
+            prev = s;
+            if (s.contains(" ")) s = s.replaceAll(LEADING_FILLER, "");
+            s = s.replaceAll(TRAILING_FILLER, "").trim();
+        } while (!s.equals(prev));
+        return canonical(s);
+    }
+
+    /** Rewrite common alternative phrasings into the forms the handlers understand. */
+    static String canonical(String s) {
+        String[][] rules = {
+                // calls
+                {"^(?:make|place|start|do) (?:a |an )?(?:phone |voice )?call (?:to|with) (.+)$", "call $1"},
+                {"^(?:make|place|start) (?:a |an )?video call (?:to|with) (.+)$", "video call $1"},
+                {"^give (.+?) a (?:call|ring|buzz)$", "call $1"},
+                {"^(?:call|dial|phone|ring) (?:up )?to (.+)$", "call $1"},
+                {"^(?:talk|speak) (?:to|with) (.+)$", "call $1"},
+                {"^(?:get|put) me through to (.+)$", "call $1"},
+                // messages
+                {"^send (?:a |an )?(?:text|message|sms|msg)(?: message)? (?:to )?(.+?) on whats ?app(.*)$", "whatsapp $1$2"},
+                {"^send (.+?) (?:a |an )?whats ?app(?: message)?(?: (?:saying|that says|that|to say) (.+))?$", "whatsapp $1 saying $2"},
+                {"^send (.+?) (?:a |an )?(?:text|message|sms|msg)(?: message)?(?: (?:saying|that says|that|to say) (.+))?$", "text $1 saying $2"},
+                {"^(?:write|compose|draft) (?:a |an )?(?:text|message|sms)(?: message)? (?:to|for) (.+)$", "text $1"},
+                {"^(?:send|write) (?:a |an )?(?:msg|message|text) (?:to )?(.+)$", "text $1"},
+                // reminders
+                {"^(?:don't|do not) let me forget (?:to |about )?(.+)$", "remind me to $1"},
+                {"^(?:can you |please )?remind me (?:that i need |that i have |i need |i have )to (.+)$", "remind me to $1"},
+                {"^(?:make sure i|help me remember to) (.+)$", "remind me to $1"},
+                // apps / camera
+                {"^open up (.+)$", "open $1"},
+                {"^(open|launch|start) (?:the |my )?(.+?) (?:app|application)$", "$1 $2"},
+                // alarms / timers
+                {"^(?:put|create|add|make) (?:an |a )?alarm(.*)$", "set an alarm$1"},
+                {"^(?:put|create|add|make) (?:a )?timer(.*)$", "set a timer$1"},
+                {"^(\\d+) (minutes?|mins?|hours?|seconds?|secs?) timer$", "set a timer for $1 $2"},
+                {"^set (?:a |an )?(\\d+) (minutes?|mins?|hours?|seconds?|secs?) timer$", "set a timer for $1 $2"},
+                // music
+                {"^play (?:me )?(?:some|any|my)? ?(?:songs|music|song)$", "play music"},
+                {"^play (?:me )?(?:some |a )?(?:songs?|music) (?:by|from|of) (.+)$", "play $1"},
+                {"^play (.+?) (?:songs|song|music)$", "play $1"},
+                {"^(?:i want to |let's )?listen to (?:some )?music$", "play music"},
+        };
+        for (String[] r : rules) {
+            if (s.matches(r[0])) {
+                s = s.replaceAll(r[0], r[1]).replaceAll("\\s+saying\\s*$", "").trim();
+                break;
+            }
         }
-        s = s.replaceAll("[,]?\\s+please$", "").replaceAll("[.!?]+$", "").trim();
         return s;
+    }
+
+    /**
+     * How strongly a recognizer guess looks like something we can act on. Used to choose the
+     * best of the recognizer's alternatives ("call mom" beats "colour mom").
+     */
+    public static int score(String raw) {
+        String s = normalize(raw);
+        if (s.isEmpty()) return 0;
+        if (s.matches("^(call|dial|phone|video call|text|message|sms|whatsapp|send|open|launch|play|pause|resume|next|previous|skip"
+                + "|set|wake|remind|navigate|directions|take me|turn|switch|increase|decrease|raise|lower|mute|unmute|volume|brightness"
+                + "|translate|define|convert|flip|roll|note|take a|read|show|find|search|tell me)\\b.*")) return 4;
+        if (s.matches(".*\\b(alarm|timer|remind|weather|forecast|flashlight|torch|volume|bluetooth|wifi|battery|calendar|notes?)\\b.*")) return 3;
+        if (MathEval.tryAnswer(s) != null || Conversions.units(s) != null) return 3;
+        if (s.matches("^(who|what|what's|when|where|why|how|which|is|are|do|does|can|did|will|tell)\\b.*")) return 2;
+        return 1;
     }
 
     /** Recover original capitalization for a piece of the normalized text (message bodies, notes). */
     private static String original(String raw, String part) {
-        int i = raw.toLowerCase(Locale.ROOT).indexOf(part);
-        if (i >= 0) return raw.substring(i, i + part.length());
-        return part.isEmpty() ? part : Character.toUpperCase(part.charAt(0)) + part.substring(1);
+        if (part.isEmpty()) return part;
+        String[] words = part.trim().split("\\s+");
+        StringBuilder re = new StringBuilder("(?i)");
+        for (int k = 0; k < words.length; k++) {
+            if (k > 0) re.append("[\\s,.;:!?\"“”-]+");
+            re.append(Pattern.quote(words[k]));
+        }
+        Matcher m = Pattern.compile(re.toString()).matcher(raw.replace('’', '\''));
+        if (m.find()) return raw.substring(m.start(), m.end());
+        return Character.toUpperCase(part.charAt(0)) + part.substring(1);
     }
 
     // =====================================================================================
@@ -191,6 +280,7 @@ public class Brain {
             case REMINDER_TIME: {
                 Calendar when = whenFrom(s);
                 if (when == null) {
+                    if (score(raw) >= 3) return false;
                     pending = Pending.REMINDER_TIME;
                     host.ask("Sorry, when? You can say something like \"in 20 minutes\" or \"tomorrow at 9\".");
                     return true;
@@ -201,6 +291,7 @@ public class Brain {
             case ALARM_TIME: {
                 int[] clock = TimeParser.parseClock(s.matches("\\d.*") ? "at " + s : s);
                 if (clock == null) {
+                    if (score(raw) >= 3) return false; // a new command, not an answer
                     pending = Pending.ALARM_TIME;
                     host.ask("What time? For example, \"6:30 AM\".");
                     return true;
@@ -211,6 +302,7 @@ public class Brain {
             case TIMER_LENGTH: {
                 int sec = TimeParser.parseDurationSeconds(s);
                 if (sec <= 0) {
+                    if (score(raw) >= 3) return false; // a new command, not an answer
                     pending = Pending.TIMER_LENGTH;
                     host.ask("For how long? For example, \"10 minutes\".");
                     return true;
@@ -568,6 +660,13 @@ public class Brain {
             mediaKey(KeyEvent.KEYCODE_MEDIA_PAUSE, "Paused.");
             return true;
         }
+        if (s.matches("play( some| my| the)? (music|songs?)|play something|play anything")) {
+            AudioManager am = (AudioManager) ctx.getSystemService(Context.AUDIO_SERVICE);
+            // Nothing paused to resume? Ask a music app to just play something.
+            if (!am.isMusicActive() && playAnything()) return true;
+            mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY, "");
+            return true;
+        }
         if (s.matches("(resume|play|continue|unpause|start)( the| my)?( music| song| playback| video| audio| podcast)?( again)?|keep playing|play it")) {
             mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY, "");
             return true;
@@ -586,6 +685,15 @@ public class Brain {
             String app = m.group(2);
             playMusic(query, app);
             return true;
+        }
+        return false;
+    }
+
+    private boolean playAnything() {
+        String[] apps = {"com.spotify.music", "com.google.android.apps.youtube.music", "com.jio.media.jiobeats",
+                "com.gaana", "com.bsbportal.music", "com.sec.android.app.music"};
+        for (String pkg : apps) {
+            if (isInstalled(pkg) && playFromSearch("", pkg)) return true;
         }
         return false;
     }
@@ -636,7 +744,7 @@ public class Brain {
                 .putExtra(MediaStore.EXTRA_MEDIA_FOCUS, "vnd.android.cursor.item/*")
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         if (pkg != null) i.setPackage(pkg);
-        return host.launch(i, "Playing " + query + ".");
+        return host.launch(i, query.isEmpty() ? "Playing some music." : "Playing " + query + ".");
     }
 
     private void youtube(String q) {
@@ -1218,7 +1326,7 @@ public class Brain {
             host.launch(i, "Smile!");
             return true;
         }
-        if (s.matches(".*\\b(take|click|snap|capture) (a |an )?(photo|picture|pic|snap|shot)\\b.*|^(open |launch |start )?(the )?camera$")) {
+        if (s.matches(".*\\b(take|click|snap|capture) (a |an )?(photo|picture|pic|snap|shot)\\b.*|^(open |launch |start )?(the )?camera( app)?$")) {
             host.launch(new Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA), "Opening the camera.");
             return true;
         }
@@ -1461,33 +1569,69 @@ public class Brain {
             });
             return true;
         }
-        Matcher q = Pattern.compile("^(?:who|what|where)(?:'s| is| was| are| were)\\s+(?:a |an |the )?(.+)$|^(?:tell me about|tell me something about|what do you know about|search wikipedia for|wikipedia|look up|who invented|who founded|who wrote|who discovered|who made|who created)\\s+(.+)$").matcher(s);
-        if (!q.find()) {
-            Matcher search = Pattern.compile("^(?:search|google|search for|search the web for|search google for|look for|find)\\s+(.+)$").matcher(s);
-            if (search.find()) {
-                webSearch(search.group(1), "Searching for " + search.group(1) + ".");
-                return true;
-            }
-            return false;
+        Matcher search = Pattern.compile("^(?:search|google|search for|search the web for|search google for|search online for|look for|find|look up online)\\s+(.+)$").matcher(s);
+        if (search.find() && !s.startsWith("look up ")) {
+            webSearch(search.group(1), "Searching for " + search.group(1) + ".");
+            return true;
         }
-        String topic = q.group(1) != null ? q.group(1) : q.group(2);
-        if (s.matches("^who (invented|founded|wrote|discovered|made|created) .*")) topic = s.replaceFirst("^who \\w+ ", "");
-        topic = topic.replaceAll("\\s+(now|today|currently)$", "").trim();
-        if (topic.matches("(my|your|this|that|it|up|going on|happening|new)\\b.*")) return false;
+        boolean question = s.matches("^(who|what|what's|whats|when|where|where's|why|how|which|whose|is|are|was|were|do|does|did|can|could|will|would|should|tell me|explain|describe)\\b.*")
+                || s.matches("^(look up|wikipedia|search wikipedia for)\\b.*");
+        if (!question) return false;
+        String topic = topicOf(s);
+        if (topic != null && topic.matches("(my|your|you|me|i|this|that|it|up|going on|happening|new|wrong)\\b.*")) topic = null;
         final String t = topic;
         host.thinking();
         bg.execute(() -> {
-            String a;
+            String a = null;
             try {
-                a = WebSkills.wikipedia(t);
-            } catch (Exception e) {
-                a = null;
+                a = WebSkills.instantAnswer(s);
+            } catch (Exception ignored) {
+            }
+            if (a == null && t != null) {
+                try {
+                    a = WebSkills.wikipedia(t);
+                } catch (Exception ignored) {
+                }
             }
             String ans = a;
             host.runOnUi(() -> {
                 if (ans != null) host.say(ans);
                 else webSearch(s, "Here's what I found on the web.");
             });
+        });
+        return true;
+    }
+
+    /** "how tall is mount everest" -> "mount everest", "when was gandhi born" -> "gandhi". */
+    static String topicOf(String s) {
+        String t = s;
+        t = t.replaceFirst("^(?:tell me (?:something |more )?about|what do you know about|search wikipedia for|wikipedia|look up|explain|describe)\\s+", "");
+        t = t.replaceFirst("^how (?:tall|old|big|far|long|high|deep|heavy|large|fast|hot|cold|wide|much does|many people live in)\\s+(?:is|are|was|were|away is)?\\s*", "");
+        t = t.replaceFirst("^(?:who|what|when|where|which|whose|why|how)(?:'s| is| are| was| were| did| does| do| has| have)?\\s+", "");
+        t = t.replaceFirst("^(?:invented|founded|wrote|discovered|made|created|directed|painted|built|owns|composed|sang|won)\\s+", "");
+        t = t.replaceFirst("\\s+(?:born|founded|built|invented|created|made|released|established|discovered|formed|located|from|die|died|start|started|happen|happened|mean)$", "");
+        t = t.replaceFirst("^(?:a|an|the)\\s+", "").replaceAll("\\s+(now|today|currently|right now)$", "").trim();
+        return t.isEmpty() || t.equals(s) && s.matches("^(is|are|do|does|did|can|could|will|would|should|why)\\b.*") ? null : t;
+    }
+
+    private boolean conversions(String s) {
+        String u = Conversions.units(s);
+        if (u != null) {
+            host.say(u);
+            return true;
+        }
+        Object[] q = Conversions.currencyQuery(s);
+        if (q == null) return false;
+        host.thinking();
+        bg.execute(() -> {
+            String a;
+            try {
+                a = Conversions.currency(q);
+            } catch (Exception e) {
+                a = null;
+            }
+            String ans = a != null ? a : "I couldn't get exchange rates right now. Check your internet connection.";
+            host.runOnUi(() -> host.say(ans));
         });
         return true;
     }

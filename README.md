@@ -17,12 +17,13 @@ A free, Siri-style voice assistant for Android, made for the **Samsung Galaxy A1
 | Apps & music | "Open Instagram" · "Play Arijit Singh" · "Play lo-fi on Spotify" · "Pause" · "Next song" |
 | Phone controls | "Turn on the flashlight" · "Volume up" · "Set volume to 50 percent" · "Brightness 30 percent" · "Do not disturb on" · "Silent mode" · "Wi-Fi" · "Bluetooth" · "Battery" |
 | Maps | "Navigate to the airport" · "Take me home" · "Find petrol pumps near me" |
-| Answers | "Who is Sundar Pichai?" · "What is a black hole?" · "Define serendipity" · "What's the weather tomorrow?" · "Weather in Delhi" · "What time is it in London?" |
+| Answers | "Who is Sundar Pichai?" · "How tall is Mount Everest?" · "When was Gandhi born?" · "Define serendipity" · "What's the weather tomorrow?" · "Weather in Delhi" · "What time is it in London?" |
 | Math | "What's 18 percent of 2450?" · "Square root of 144" · "12 times 7" |
+| Conversions | "Convert 10 km to miles" · "How many grams in a pound" · "30 Celsius in Fahrenheit" · "100 dollars in rupees" |
 | Notes | "Take a note buy eggs" · "Remember that I parked on level 3" · "Read my notes" |
 | Other | "Translate good morning to Hindi" · "Take a selfie" · "Tell me a joke" · "Flip a coin" · "Roll a dice" |
 
-If it doesn't understand something, it opens a Google search for it.
+You can talk naturally: "Hey Google, can you please call Mom?", "Give Priya a call", "Don't let me forget to buy milk tomorrow" and "Set a 5-minute timer" all work. Whatever it heard appears on screen in grey, so you can see when it misheard. If it doesn't understand something, it opens a Google search for it.
 
 ---
 
@@ -75,7 +76,14 @@ Then call it like Siri:
 - **Side button (recommended):** Settings → Advanced features → Side button → **Double press → Open app → Voice Agent**. Some One UI versions also let **Press and hold** open the digital assistant.
 - **Quick Settings tile:** swipe down twice → ✏️ edit → drag **Voice Agent** into your tiles.
 
-### 4. Optional: talk without internet
+### 4. For the best voice recognition
+
+- Keep the **Google** app updated in the Play Store. Voice Agent uses Google's speech engine when it's installed, which is much more accurate than the phone's default. If that engine fails, it switches to another one by itself.
+- If your SIM is from India, it listens in **Indian English**, which handles Indian accents and names better.
+- Allow **Contacts** access. On Android 13 and later, your contact names are passed to the recognizer so it spells them correctly.
+- Speak after the orb starts moving. It waits for a short pause before deciding you've finished.
+
+### 5. Optional: talk without internet
 
 Settings → General management → Keyboard list and default → Google voice typing → **Offline speech recognition** → download your language. If you don't see this option, install the **Google** app or **Speech Recognition & Synthesis** from the Play Store.
 

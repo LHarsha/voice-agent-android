@@ -33,6 +33,11 @@
         <package android:name="com.google.android.apps.youtube.music" />
         <package android:name="com.google.android.youtube" />
         <package android:name="com.whatsapp" />
+        <package android:name="com.jio.media.jiobeats" />
+        <package android:name="com.gaana" />
+        <package android:name="com.bsbportal.music" />
+        <package android:name="com.sec.android.app.music" />
+        <package android:name="com.google.android.googlequicksearchbox" />
         <!-- So "open <app>" can see installed apps -->
         <intent>
             <action android:name="android.intent.action.MAIN" />
