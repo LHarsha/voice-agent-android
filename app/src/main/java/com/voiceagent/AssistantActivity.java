@@ -71,6 +71,7 @@ public class AssistantActivity extends Activity implements Brain.Host {
     private LinearLayout inputRow;
     private EditText input;
     private TextView setupChip;
+    private TextView smartChip;
 
     private boolean listenAfterSpeech;
     private boolean closeAfterSpeech;
@@ -115,6 +116,7 @@ public class AssistantActivity extends Activity implements Brain.Host {
         closeAfterSpeech = false;
         silentRetries = 0;
         engineSwitches = 0;
+        brain.newSession();
         startListening();
     }
 
@@ -193,6 +195,22 @@ public class AssistantActivity extends Activity implements Brain.Host {
         clp.bottomMargin = dp(8);
         panel.addView(setupChip, clp);
 
+        smartChip = new TextView(this);
+        smartChip.setText("✦  Turn on smart mode (free)  ›");
+        smartChip.setTextColor(Color.parseColor("#BFF0FF"));
+        smartChip.setTextSize(13);
+        smartChip.setPadding(dp(14), dp(8), dp(14), dp(8));
+        GradientDrawable sb = new GradientDrawable();
+        sb.setColor(Color.parseColor("#2233D1FF"));
+        sb.setStroke(dp(1), Color.parseColor("#6633D1FF"));
+        sb.setCornerRadius(dp(18));
+        smartChip.setBackground(sb);
+        smartChip.setOnClickListener(v -> showSmartSettings());
+        LinearLayout.LayoutParams sclp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        sclp.gravity = Gravity.CENTER_HORIZONTAL;
+        sclp.bottomMargin = dp(8);
+        panel.addView(smartChip, sclp);
+
         scroll = new ScrollView(this);
         scroll.setVerticalScrollBarEnabled(false);
         log = new LinearLayout(this);
@@ -245,6 +263,11 @@ public class AssistantActivity extends Activity implements Brain.Host {
         close.setContentDescription("Close");
         close.setOnClickListener(v -> finish());
         orbRow.addView(close, new FrameLayout.LayoutParams(dp(48), dp(48), Gravity.END | Gravity.CENTER_VERTICAL));
+        TextView gear = roundButton("⚙");
+        gear.setContentDescription("Smart mode settings");
+        gear.setOnClickListener(v -> showSmartSettings());
+        FrameLayout.LayoutParams glp = new FrameLayout.LayoutParams(dp(40), dp(40), Gravity.END | Gravity.BOTTOM);
+        orbRow.addView(gear, glp);
         panel.addView(orbRow, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(128)));
 
         // Type-instead row
@@ -376,6 +399,85 @@ public class AssistantActivity extends Activity implements Brain.Host {
 
     private void updateSetupChip() {
         if (setupChip != null) setupChip.setVisibility(isDefaultAssistant() ? View.GONE : View.VISIBLE);
+        if (smartChip != null) smartChip.setVisibility(Gemini.enabled(this) ? View.GONE : View.VISIBLE);
+    }
+
+    // ------------------------------------------------------------------ smart mode settings
+
+    private void showSmartSettings() {
+        session++;
+        ui.removeCallbacks(listenRunnable);
+        if (recognizer != null) recognizer.cancel();
+        if (tts != null) tts.stop();
+        setIdle(null);
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(22), dp(8), dp(22), 0);
+        TextView info = new TextView(this);
+        info.setText("Smart mode uses Google's Gemini AI to understand what you say, so you can talk naturally "
+                + "and ask anything. It's free: you only need a free API key.\n\n"
+                + "1. Tap \"Get free key\" and sign in with your Google account.\n"
+                + "2. Tap \"Create API key\", then copy it.\n"
+                + "3. Come back, paste it below, and tap Save.\n\n"
+                + "Privacy: what you say is sent to Google to be understood. On the free tier Google may use it to "
+                + "improve its products. Your contacts and notes stay on the phone. Simple commands like the time "
+                + "or the flashlight never leave the phone.");
+        info.setTextSize(14);
+        box.addView(info);
+        EditText keyInput = new EditText(this);
+        keyInput.setHint("Paste your Gemini API key");
+        keyInput.setSingleLine(true);
+        keyInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
+        keyInput.setText(Gemini.key(this));
+        box.addView(keyInput);
+
+        android.app.AlertDialog d = new android.app.AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle("Smart mode")
+                .setView(box)
+                .setPositiveButton("Save", (dialog, which) -> {
+                    String k = keyInput.getText().toString().replaceAll("\\s+", "");
+                    Gemini.setKey(this, k);
+                    brain.newSession();
+                    updateSetupChip();
+                    if (k.isEmpty()) {
+                        say("Smart mode is off. I'll use offline mode.");
+                    } else {
+                        testSmartMode();
+                    }
+                })
+                .setNeutralButton("Get free key", (dialog, which) -> {
+                    try {
+                        startActivity(new Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://aistudio.google.com/apikey"))
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                    } catch (ActivityNotFoundException ignored) {
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .create();
+        d.show();
+    }
+
+    /** One quick request so the user knows right away whether the key works. */
+    private void testSmartMode() {
+        thinking();
+        Gemini g = new Gemini(this);
+        new Thread(() -> {
+            String msg;
+            try {
+                org.json.JSONObject r = g.understand("Say a one-line hello confirming smart mode works.");
+                String sayText = r.optString("say", "").trim();
+                msg = "Smart mode is on. " + (sayText.isEmpty() ? "" : sayText);
+            } catch (Gemini.KeyException e) {
+                msg = "That key didn't work. Copy it again from Google AI Studio and paste the whole key.";
+            } catch (Gemini.RateLimitException e) {
+                msg = "The key works, but the free limit is used up for now. Try again in a minute.";
+            } catch (Exception e) {
+                msg = "I couldn't reach Gemini. Check your internet connection. (" + e.getMessage() + ")";
+            }
+            String m = msg;
+            runOnUi(() -> say(m));
+        }).start();
     }
 
     private void openAssistantSettings() {
@@ -788,6 +890,11 @@ public class AssistantActivity extends Activity implements Brain.Host {
         addBubble(text, false);
         closeAfterSpeech = true;
         speak(text, false);
+    }
+
+    @Override
+    public void notice(String text) {
+        addBubble(text, false);
     }
 
     @Override

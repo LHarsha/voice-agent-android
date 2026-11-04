@@ -76,14 +76,26 @@ Then call it like Siri:
 - **Side button (recommended):** Settings → Advanced features → Side button → **Double press → Open app → Voice Agent**. Some One UI versions also let **Press and hold** open the digital assistant.
 - **Quick Settings tile:** swipe down twice → ✏️ edit → drag **Voice Agent** into your tiles.
 
-### 4. For the best voice recognition
+### 4. Turn on smart mode (free, recommended)
+
+Smart mode uses Google's **Gemini** AI to understand what you say. You can talk the way you'd talk to a person ("remind me to call the bank when I wake up tomorrow", "text her that I'm 10 minutes late", "make it 8 instead"), and it answers general questions properly. It costs nothing, but it needs a free API key:
+
+1. Open Voice Agent and tap **✦ Turn on smart mode (free)** (or the **⚙** button).
+2. Tap **Get free key**, sign in with your Google account, tap **Create API key**, and copy it.
+3. Go back to Voice Agent, paste the key, and tap **Save**. It says "Smart mode is on" when the key works.
+
+How it works: simple commands (the time, flashlight, volume, pause, timers, math) are still handled instantly on the phone. Everything else goes to Gemini, which picks an action, and the phone carries it out. If there's no internet, the free limit is used up, or the key is wrong, it quietly falls back to offline mode.
+
+Privacy: what you say is sent to Google to be understood. On the free tier, Google may use it to improve its products. Your contact list and notes are not sent. Turn smart mode off by clearing the key in ⚙.
+
+### 5. For the best voice recognition
 
 - Keep the **Google** app updated in the Play Store. Voice Agent uses Google's speech engine when it's installed, which is much more accurate than the phone's default. If that engine fails, it switches to another one by itself.
 - If your SIM is from India, it listens in **Indian English**, which handles Indian accents and names better.
 - Allow **Contacts** access. On Android 13 and later, your contact names are passed to the recognizer so it spells them correctly.
 - Speak after the orb starts moving. It waits for a short pause before deciding you've finished.
 
-### 5. Optional: talk without internet
+### 6. Optional: talk without internet
 
 Settings → General management → Keyboard list and default → Google voice typing → **Offline speech recognition** → download your language. If you don't see this option, install the **Google** app or **Speech Recognition & Synthesis** from the Play Store.
 
@@ -116,7 +128,9 @@ You can change the voice under Settings → General management → **Text-to-spe
 ```
 app/src/main/java/com/voiceagent/
   AssistantActivity.java   overlay UI, speech recognition, text-to-speech
-  Brain.java               understands commands and carries them out
+  Brain.java               understands commands (offline rules) and carries them out
+  Gemini.java              smart mode: Gemini picks the action, Brain performs it
+  Conversions.java         units and currency
   OrbView.java             animated glowing orb
   TimeParser.java          "tomorrow at 7:30 pm", "in 20 minutes"
   MathEval.java            spoken math

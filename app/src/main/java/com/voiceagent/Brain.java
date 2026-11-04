@@ -77,6 +77,9 @@ public class Brain {
         /** Say goodbye and close. */
         void close(String text);
 
+        /** Show a small note on screen without speaking it. */
+        void notice(String text);
+
         void runOnUi(Runnable r);
     }
 
@@ -123,6 +126,21 @@ public class Brain {
         if (pending != Pending.NONE && handlePending(s, raw)) return;
         pending = Pending.NONE;
 
+        if (ctx != null && Gemini.enabled(ctx) && !fastPath(s)) {
+            smart(raw, s, light);
+            return;
+        }
+        local(s, raw, light);
+    }
+
+    /** Start a fresh conversation (the assistant was opened again). */
+    public void newSession() {
+        pending = Pending.NONE;
+        if (gemini != null) gemini.clearHistory();
+    }
+
+    /** The offline, rule-based understanding. */
+    private void local(String s, String raw, String light) {
         if (smallTalk(light) || smallTalk(s)) return;
         if (timeAndDate(s)) return;
         if (!s.startsWith("play ") && device(s)) return;
@@ -236,6 +254,375 @@ public class Brain {
         if (MathEval.tryAnswer(s) != null || Conversions.units(s) != null) return 3;
         if (s.matches("^(who|what|what's|when|where|why|how|which|is|are|do|does|can|did|will|tell)\\b.*")) return 2;
         return 1;
+    }
+
+    // =====================================================================================
+    // Smart mode (Gemini)
+    // =====================================================================================
+
+    private Gemini gemini;
+    private boolean warnedSmart;
+
+    /** Simple, unambiguous commands are handled instantly on the phone, even in smart mode. */
+    private boolean fastPath(String s) {
+        if (s.matches("(what('s| is) the )?(current )?time( is it)?( right now| now)?|what time is it|tell me the time"
+                + "|(what('s| is) )?(the |today's |todays )?date( today)?|what day is (it|today)( today)?")) return timeAndDate(s);
+        if (s.matches("(pause|stop|resume|continue|unpause|next|skip|previous|prev)( the| this| my)?( music| song| track| video| playback)?"
+                + "|play( the)? (next|previous)( song| track)?|play( some| my)? music")) return media(s);
+        if (s.matches("(turn|switch) (on|off) (the )?(flash ?light|torch)|(flash ?light|torch) (on|off)")) return device(s);
+        if (s.matches("(turn |set )?(the )?volume (up|down)|(increase|decrease|raise|lower) (the )?volume|mute|unmute")) return device(s);
+        if (s.matches("(what's |what is )?(my )?battery( level| percentage| status)?")) return device(s);
+        if (s.matches(".*\\btimer\\b.*") && TimeParser.parseDurationSeconds(s) > 0 && !s.matches(".*\\b(cancel|stop|delete)\\b.*")) {
+            return alarmsAndTimers(s);
+        }
+        if (MathEval.tryAnswer(s) != null) return math(s);
+        if (Conversions.units(s) != null) return conversions(s);
+        return false;
+    }
+
+    private void smart(String raw, String s, String light) {
+        if (gemini == null) gemini = new Gemini(ctx);
+        host.thinking();
+        bg.execute(() -> {
+            org.json.JSONObject r = null;
+            Exception err = null;
+            try {
+                r = gemini.understand(raw);
+            } catch (Exception e) {
+                err = e;
+            }
+            final org.json.JSONObject result = r;
+            final Exception error = err;
+            host.runOnUi(() -> {
+                if (result != null) {
+                    try {
+                        perform(result, raw);
+                        return;
+                    } catch (RuntimeException e) {
+                        // fall through to the offline engine
+                    }
+                } else if (!warnedSmart) {
+                    warnedSmart = true;
+                    if (error instanceof Gemini.KeyException) {
+                        host.notice("Smart mode: your Gemini key isn't working, so I'm using offline mode. Tap ⚙ to check it.");
+                    } else if (error instanceof Gemini.RateLimitException) {
+                        host.notice("Smart mode: the free Gemini limit is used up for now, so I'm using offline mode.");
+                    } else {
+                        String why = error == null || error.getMessage() == null ? "" : " (" + error.getMessage() + ")";
+                        host.notice("Smart mode didn't respond, so I'm using offline mode." + why);
+                    }
+                }
+                local(s, raw, light);
+            });
+        });
+    }
+
+    /** Carry out the action Gemini chose. */
+    private void perform(org.json.JSONObject r, String raw) {
+        String action = r.optString("action", "answer").trim().toLowerCase(Locale.ROOT);
+        org.json.JSONObject a = r.optJSONObject("args");
+        if (a == null) a = new org.json.JSONObject();
+        String say = r.optString("say", "").trim();
+        boolean expect = r.optBoolean("expect_reply", false);
+        String who = a.optString("contact", "").trim();
+        String number = a.optString("number", "").replaceAll("[^0-9+]", "");
+
+        switch (action) {
+            case "call":
+                callTo(who, number, raw, false);
+                return;
+            case "video_call":
+                callTo(who, number, raw, true);
+                return;
+            case "sms":
+            case "whatsapp":
+                messageTo(who, number, a.optString("message", "").trim(), action.equals("whatsapp"), raw);
+                return;
+            case "email": {
+                String to = a.optString("to", "");
+                Intent i = new Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:" + (to.contains("@") ? to : "")));
+                if (!a.optString("subject").isEmpty()) i.putExtra(Intent.EXTRA_SUBJECT, a.optString("subject"));
+                if (!a.optString("body").isEmpty()) i.putExtra(Intent.EXTRA_TEXT, a.optString("body"));
+                host.launch(i, "Here's your email.");
+                return;
+            }
+            case "open_app": {
+                String name = a.optString("name", "").trim().toLowerCase(Locale.ROOT);
+                if (name.isEmpty() || !openApp("open " + name)) host.ask("Which app should I open?");
+                return;
+            }
+            case "play_music": {
+                String q = a.optString("query", "").trim();
+                String app = a.optString("app", "").trim().toLowerCase(Locale.ROOT);
+                if (q.isEmpty()) {
+                    if (!playAnything()) mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY, "");
+                } else {
+                    playMusic(q, app.isEmpty() ? null : app);
+                }
+                return;
+            }
+            case "media": {
+                String c = a.optString("command", "resume");
+                int key = c.startsWith("pause") || c.startsWith("stop") ? KeyEvent.KEYCODE_MEDIA_PAUSE
+                        : c.startsWith("next") ? KeyEvent.KEYCODE_MEDIA_NEXT
+                        : c.startsWith("prev") ? KeyEvent.KEYCODE_MEDIA_PREVIOUS : KeyEvent.KEYCODE_MEDIA_PLAY;
+                mediaKey(key, key == KeyEvent.KEYCODE_MEDIA_PAUSE ? "Paused." : "");
+                return;
+            }
+            case "set_alarm": {
+                Calendar c = Calendar.getInstance();
+                c.set(Calendar.HOUR_OF_DAY, a.optInt("hour", 7));
+                c.set(Calendar.MINUTE, a.optInt("minute", 0));
+                c.set(Calendar.SECOND, 0);
+                Calendar date = parseDate(a.optString("date", ""));
+                if (date != null) {
+                    c.set(date.get(Calendar.YEAR), date.get(Calendar.MONTH), date.get(Calendar.DAY_OF_MONTH));
+                } else if (!c.after(Calendar.getInstance())) {
+                    c.add(Calendar.DAY_OF_MONTH, 1);
+                }
+                String label = a.optString("label", "").trim();
+                setAlarm(c, label.isEmpty() ? null : label);
+                return;
+            }
+            case "set_timer": {
+                int sec = a.optInt("seconds", 0);
+                if (sec <= 0) {
+                    pending = Pending.TIMER_LENGTH;
+                    host.ask("For how long?");
+                } else {
+                    setTimer(sec);
+                }
+                return;
+            }
+            case "show_alarms":
+                host.launch(new Intent(AlarmClock.ACTION_SHOW_ALARMS), "Here are your alarms.");
+                return;
+            case "show_timers":
+                host.launch(new Intent(AlarmClock.ACTION_SHOW_TIMERS), "Here are your timers.");
+                return;
+            case "reminder": {
+                String text = a.optString("text", "").trim();
+                Calendar at = parseDateTime(a.optString("at", ""));
+                if (text.isEmpty()) {
+                    pendingReminderTime = at;
+                    pending = Pending.REMINDER_TEXT;
+                    host.ask("What should I remind you about?");
+                } else if (at == null) {
+                    pendingText = text;
+                    pending = Pending.REMINDER_TIME;
+                    host.ask("When should I remind you?");
+                } else {
+                    if (!at.after(Calendar.getInstance())) at.add(Calendar.DAY_OF_MONTH, 1);
+                    scheduleReminder(cleanSentence(text), at);
+                }
+                return;
+            }
+            case "calendar_add": {
+                String title = a.optString("title", "Event");
+                Calendar start = parseDateTime(a.optString("start", ""));
+                Intent i = new Intent(Intent.ACTION_INSERT).setData(CalendarContract.Events.CONTENT_URI)
+                        .putExtra(CalendarContract.Events.TITLE, title);
+                if (start != null) {
+                    i.putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, start.getTimeInMillis());
+                    i.putExtra(CalendarContract.EXTRA_EVENT_END_TIME, start.getTimeInMillis() + a.optInt("minutes", 60) * 60_000L);
+                }
+                host.launch(i, "Here's your event" + (start != null ? " for " + TimeParser.speakWhen(start) : "") + ". Tap save to confirm.");
+                return;
+            }
+            case "calendar_read": {
+                Perm p = ensure(raw, Manifest.permission.READ_CALENDAR);
+                if (p == Perm.REQUESTED) return;
+                if (p == Perm.DENIED) {
+                    host.say("I need calendar access to read your schedule.");
+                    return;
+                }
+                readCalendar("tomorrow".equals(a.optString("day")) ? 1 : 0);
+                return;
+            }
+            case "note_add":
+                saveNote(cleanSentence(a.optString("text", "")));
+                return;
+            case "notes_read":
+                notes("read my notes", raw);
+                return;
+            case "navigate": {
+                String dest = a.optString("destination", "").trim();
+                String mode = a.optString("mode", "");
+                String m = mode.startsWith("walk") ? "&mode=w" : mode.startsWith("bike") ? "&mode=b" : "";
+                Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse("google.navigation:q=" + Uri.encode(dest) + m));
+                if (!host.launch(i, "Getting directions to " + dest + ".")) {
+                    host.launch(new Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=" + Uri.encode(dest))), "Here's " + dest + " on the map.");
+                }
+                return;
+            }
+            case "map_search": {
+                String q = a.optString("query", "");
+                host.launch(new Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=" + Uri.encode(q))), "Here are " + q + " nearby.");
+                return;
+            }
+            case "weather": {
+                String place = a.optString("place", "").trim();
+                boolean tomorrow = "tomorrow".equals(a.optString("day"));
+                weather("weather" + (place.isEmpty() ? "" : " in " + place.toLowerCase(Locale.ROOT)) + (tomorrow ? " tomorrow" : ""));
+                return;
+            }
+            case "time_in":
+                timeIn(a.optString("place", ""));
+                return;
+            case "flashlight":
+                setTorch(a.optBoolean("on", true));
+                return;
+            case "volume": {
+                String change = a.optString("change", "");
+                volume(a.has("level") ? "set volume to " + a.optInt("level") + " percent"
+                        : change.equals("max") ? "max volume" : change.equals("mute") ? "mute" : change.equals("unmute") ? "unmute"
+                        : change.equals("down") ? "volume down" : "volume up");
+                return;
+            }
+            case "brightness": {
+                String change = a.optString("change", "");
+                brightness(a.has("level") ? "brightness " + a.optInt("level") + " percent"
+                        : change.equals("auto") ? "auto brightness" : change.equals("down") ? "brightness down" : "brightness up");
+                return;
+            }
+            case "do_not_disturb":
+                doNotDisturb(a.optBoolean("on", true));
+                return;
+            case "ringer": {
+                String mode = a.optString("mode", "normal");
+                ringer(mode.startsWith("vib") ? "vibrate mode" : mode.startsWith("sil") ? "silent mode" : "sound mode");
+                return;
+            }
+            case "settings": {
+                String page = a.optString("page", "main");
+                Intent i;
+                switch (page) {
+                    case "wifi": i = Build.VERSION.SDK_INT >= 29 ? new Intent(Settings.Panel.ACTION_WIFI) : new Intent(Settings.ACTION_WIFI_SETTINGS); break;
+                    case "bluetooth": i = new Intent(Settings.ACTION_BLUETOOTH_SETTINGS); break;
+                    case "mobile_data": i = Build.VERSION.SDK_INT >= 29 ? new Intent(Settings.Panel.ACTION_INTERNET_CONNECTIVITY) : new Intent(Settings.ACTION_DATA_ROAMING_SETTINGS); break;
+                    case "airplane": i = new Intent(Settings.ACTION_AIRPLANE_MODE_SETTINGS); break;
+                    case "hotspot": i = new Intent(Settings.ACTION_WIRELESS_SETTINGS); break;
+                    case "location": i = new Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS); break;
+                    case "nfc": i = new Intent(Settings.ACTION_NFC_SETTINGS); break;
+                    case "battery_saver": i = new Intent(Settings.ACTION_BATTERY_SAVER_SETTINGS); break;
+                    case "display": i = new Intent(Settings.ACTION_DISPLAY_SETTINGS); break;
+                    case "sound": i = new Intent(Settings.ACTION_SOUND_SETTINGS); break;
+                    case "apps": i = new Intent(Settings.ACTION_APPLICATION_SETTINGS); break;
+                    default: i = new Intent(Settings.ACTION_SETTINGS);
+                }
+                host.launch(i, say.isEmpty() ? "Here you go." : say);
+                return;
+            }
+            case "camera": {
+                String mode = a.optString("mode", "photo");
+                camera(mode.equals("selfie") ? "take a selfie" : mode.equals("video") ? "record a video" : "take a photo");
+                return;
+            }
+            case "translate": {
+                String lang = a.optString("language", "").toLowerCase(Locale.ROOT).trim();
+                String code = LANGS.get(lang);
+                String text = a.optString("text", "");
+                String url = "https://translate.google.com/?sl=auto&op=translate&tl=" + (code != null ? code : "en") + "&text=" + Uri.encode(text);
+                host.launch(new Intent(Intent.ACTION_VIEW, Uri.parse(url)), say.isEmpty() ? "Here's the translation." : say);
+                return;
+            }
+            case "web_search":
+                webSearch(a.optString("query", raw), say.isEmpty() ? "Here's what I found on the web." : say);
+                return;
+            case "battery":
+                device("battery");
+                return;
+            case "answer":
+            case "none":
+            default:
+                if (say.isEmpty()) say = "Sorry, I didn't get that. Could you say it another way?";
+                if (expect) host.ask(say);
+                else host.say(say);
+        }
+    }
+
+    private static Calendar parseDateTime(String iso) {
+        if (iso == null || iso.isEmpty()) return null;
+        String[] fmts = {"yyyy-MM-dd'T'HH:mm", "yyyy-MM-dd'T'HH:mm:ss", "yyyy-MM-dd HH:mm"};
+        for (String f : fmts) {
+            try {
+                SimpleDateFormat df = new SimpleDateFormat(f, Locale.US);
+                df.setLenient(false);
+                Date d = df.parse(iso.length() > 19 ? iso.substring(0, 19) : iso);
+                if (d == null) continue;
+                Calendar c = Calendar.getInstance();
+                c.setTime(d);
+                return c;
+            } catch (java.text.ParseException ignored) {
+            }
+        }
+        return null;
+    }
+
+    private static Calendar parseDate(String iso) {
+        if (iso == null || iso.length() < 10) return null;
+        return parseDateTime(iso.substring(0, 10) + "T00:00");
+    }
+
+    /** Call someone by name or number (smart mode). */
+    private void callTo(String who, String number, String retry, boolean video) {
+        if (!number.isEmpty() && !video) {
+            placeCall(number, number);
+            return;
+        }
+        if (who.isEmpty()) {
+            host.ask("Who should I call?");
+            return;
+        }
+        Perm p = ensure(retry, Manifest.permission.READ_CONTACTS, Manifest.permission.CALL_PHONE);
+        if (p == Perm.REQUESTED) return;
+        if (!granted(Manifest.permission.READ_CONTACTS)) {
+            host.say("I need permission to read your contacts to call someone by name.");
+            return;
+        }
+        Contacts.Match c = Contacts.find(ctx, who);
+        if (c == null) {
+            host.say("I couldn't find " + who + " in your contacts.");
+            return;
+        }
+        if (video) whatsappOrSms(c.name, c.number, "", true);
+        else placeCall(c.number, c.name);
+    }
+
+    /** Text or WhatsApp someone by name or number (smart mode). */
+    private void messageTo(String who, String number, String body, boolean whatsapp, String retry) {
+        String name, num;
+        if (!number.isEmpty()) {
+            name = number;
+            num = number;
+        } else {
+            if (who.isEmpty()) {
+                host.ask("Who should I send it to?");
+                return;
+            }
+            Perm p = ensure(retry, Manifest.permission.READ_CONTACTS);
+            if (p == Perm.REQUESTED) return;
+            if (!granted(Manifest.permission.READ_CONTACTS)) {
+                host.say("I need permission to read your contacts to message someone by name.");
+                return;
+            }
+            Contacts.Match c = Contacts.find(ctx, who);
+            if (c == null) {
+                host.say("I couldn't find " + who + " in your contacts.");
+                return;
+            }
+            name = c.name;
+            num = c.number;
+        }
+        if (body.isEmpty()) {
+            pendingName = name;
+            pendingNumber = num;
+            pendingWhatsApp = whatsapp;
+            pending = Pending.SMS_BODY;
+            host.ask("What do you want to say to " + name + "?");
+            return;
+        }
+        sendMessage(name, num, body, whatsapp);
     }
 
     /** Recover original capitalization for a piece of the normalized text (message bodies, notes). */
