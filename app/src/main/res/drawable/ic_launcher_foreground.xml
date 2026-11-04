@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- glowing orb -->
+    <path android:fillColor="#5533D1FF"
+        android:pathData="M54,24a30,30 0,1 1,0 60a30,30 0,1 1,0 -60z" />
+    <path android:fillColor="#88C94BFF"
+        android:pathData="M54,30a24,24 0,1 1,0 48a24,24 0,1 1,0 -48z" />
+    <path android:fillColor="#FF7C5CFF"
+        android:pathData="M54,36a18,18 0,1 1,0 36a18,18 0,1 1,0 -36z" />
+    <!-- sound wave -->
+    <path android:fillColor="#FFFFFFFF"
+        android:pathData="M42,50h3v8h-3z M47.5,45h3v18h-3z M53,41h3v26h-3z M58.5,46h3v16h-3z M64,51h3v6h-3z" />
+</vector>

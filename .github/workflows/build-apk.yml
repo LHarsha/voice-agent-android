@@ -1,0 +1,45 @@
+name: Build APK
+
+# Builds the app for free on GitHub's servers every time you push.
+# Download it from the "Releases" section of the repo (tag: latest)
+# or from the run's "Artifacts".
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleDebug
+          cp app/build/outputs/apk/debug/app-debug.apk VoiceAgent.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VoiceAgent-apk
+          path: VoiceAgent.apk
+
+      - name: Publish as the "latest" release (easy to download on your phone)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest VoiceAgent.apk \
+            --title "Voice Agent (latest build)" \
+            --notes "Built from ${GITHUB_SHA::7}. On your phone: tap VoiceAgent.apk to download, then open it to install." \
+            --target "$GITHUB_SHA"
