@@ -28,7 +28,7 @@ import java.util.TimeZone;
 public final class Gemini {
 
     /** Tried in order; aliases first so the app keeps working as Google releases new models. */
-    private static final String[] MODELS = {"gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-lite-latest"};
+    private static final String[] MODELS = {"gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash"};
     private static final String PREFS = "smart";
 
     public static final class KeyException extends IOException {
@@ -40,13 +40,13 @@ public final class Gemini {
     }
 
     private final List<JSONObject> history = new ArrayList<>();
+    static String baseUrl = "https://generativelanguage.googleapis.com"; // replaced only in tests
     private final Context ctx;
     private int modelIndex;
-    private boolean noThinkingConfig;
 
     public Gemini(Context ctx) {
-        this.ctx = ctx.getApplicationContext();
-        modelIndex = prefs(ctx).getInt("model", 0);
+        this.ctx = ctx == null ? null : ctx.getApplicationContext();
+        modelIndex = ctx == null ? 0 : prefs(ctx).getInt("model", 0);
         if (modelIndex >= MODELS.length) modelIndex = 0;
     }
 
@@ -80,29 +80,54 @@ public final class Gemini {
         if (key.isEmpty()) throw new KeyException("No key");
         JSONObject user = content("user", userText);
         IOException last = null;
+        boolean allRateLimited = true;
+        // Different models have separate free quotas, so a busy or missing model just means "try the next".
         for (int attempt = 0; attempt < MODELS.length; attempt++) {
-            String model = MODELS[(modelIndex + attempt) % MODELS.length];
+            int idx = (modelIndex + attempt) % MODELS.length;
             try {
-                String text = call(model, key, user);
+                String text = callModel(MODELS[idx], key, user);
                 JSONObject action = parseAction(text);
-                modelIndex = (modelIndex + attempt) % MODELS.length;
+                modelIndex = idx;
                 prefs(ctx).edit().putInt("model", modelIndex).apply();
                 history.add(user);
                 history.add(content("model", action.toString()));
                 while (history.size() > 12) history.remove(0);
                 return action;
-            } catch (ModelMissing e) {
-                last = e; // try the next model name
+            } catch (KeyException e) {
+                throw e; // same key for every model: no point trying others
+            } catch (RateLimitException e) {
+                last = e;
+            } catch (IOException e) {
+                last = e;
+                allRateLimited = false;
             }
         }
-        throw last != null ? last : new IOException("No model available");
+        if (allRateLimited && last instanceof RateLimitException) throw (RateLimitException) last;
+        throw last != null ? last : new IOException("No Gemini model answered");
     }
 
-    private static final class ModelMissing extends IOException {
-        ModelMissing(String m) { super(m); }
+    /**
+     * Thinking settings differ between model generations: Gemini 3+ takes thinkingLevel,
+     * 2.5 takes thinkingBudget, and some reject one or the other. Try them in turn.
+     */
+    private String callModel(String model, String key, JSONObject user) throws IOException {
+        String[] modes = {"level-low", "none", "budget-0"};
+        IOException last = null;
+        for (String mode : modes) {
+            try {
+                return call(model, key, user, mode);
+            } catch (BadRequest e) {
+                last = e; // try the next thinking setting
+            }
+        }
+        throw last;
     }
 
-    private String call(String model, String key, JSONObject user) throws IOException {
+    private static final class BadRequest extends IOException {
+        BadRequest(String m) { super(m); }
+    }
+
+    private String call(String model, String key, JSONObject user, String thinkingMode) throws IOException {
         try {
             JSONObject body = new JSONObject();
             body.put("systemInstruction", new JSONObject().put("parts", new JSONArray().put(new JSONObject().put("text", systemPrompt()))));
@@ -110,49 +135,66 @@ public final class Gemini {
             for (JSONObject h : history) contents.put(h);
             contents.put(user);
             body.put("contents", contents);
+            // Thinking tokens count against maxOutputTokens, so leave plenty of room for the answer.
             JSONObject gen = new JSONObject()
                     .put("temperature", 0.2)
-                    .put("maxOutputTokens", 700)
+                    .put("maxOutputTokens", 4096)
                     .put("responseMimeType", "application/json");
-            if (!noThinkingConfig) gen.put("thinkingConfig", new JSONObject().put("thinkingBudget", 0));
+            if (thinkingMode.equals("level-low")) gen.put("thinkingConfig", new JSONObject().put("thinkingLevel", "low"));
+            if (thinkingMode.equals("budget-0")) gen.put("thinkingConfig", new JSONObject().put("thinkingBudget", 0));
             body.put("generationConfig", gen);
 
-            String url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent";
+            String url = baseUrl + "/v1beta/models/" + model + ":generateContent";
             int[] status = new int[1];
             String resp = post(url, key, body.toString(), status);
-            if (status[0] == 400 && resp.contains("API_KEY_INVALID") || status[0] == 401 || status[0] == 403 && resp.contains("API key")) {
-                throw new KeyException("The Gemini key was rejected");
+            String msg = errorMessage(resp);
+            String lower = resp.toLowerCase(Locale.ROOT);
+            if (lower.contains("api_key_invalid") || lower.contains("api key not valid") || lower.contains("api key expired")) {
+                throw new KeyException("Google says the key isn't valid. Create a new key in Google AI Studio and paste it again.");
             }
-            if (status[0] == 400 && !noThinkingConfig) {
-                noThinkingConfig = true; // older/newer model without this setting: retry without it
-                return call(model, key, user);
+            if (status[0] == 403) {
+                throw new KeyException("Google refused the key (" + msg + "). Create the key in Google AI Studio, not Google Cloud.");
             }
-            if (status[0] == 404) throw new ModelMissing(model);
-            if (status[0] == 429) throw new RateLimitException("Free quota used up for now");
-            if (status[0] >= 400) {
-                String msg = resp;
-                try {
-                    msg = new JSONObject(resp).getJSONObject("error").optString("message", resp);
-                } catch (JSONException ignored) {
-                }
-                throw new IOException("Gemini error " + status[0] + ": " + (msg.length() > 120 ? msg.substring(0, 120) : msg));
+            if (lower.contains("location is not supported")) {
+                throw new KeyException("Gemini's free API isn't available in your region.");
             }
+            if (status[0] == 429) throw new RateLimitException("The free Gemini limit is used up for now (" + model + ").");
+            if (status[0] == 404) throw new IOException(model + " isn't available");
+            if (status[0] == 400) throw new BadRequest(model + ": " + msg);
+            if (status[0] >= 400) throw new IOException("Gemini error " + status[0] + " on " + model + ": " + msg);
 
             JSONObject o = new JSONObject(resp);
             JSONArray cands = o.optJSONArray("candidates");
-            if (cands == null || cands.length() == 0) throw new IOException("No answer");
-            JSONArray parts = cands.getJSONObject(0).optJSONObject("content") == null ? null
-                    : cands.getJSONObject(0).getJSONObject("content").optJSONArray("parts");
-            if (parts == null) throw new IOException("Empty answer");
+            if (cands == null || cands.length() == 0) {
+                JSONObject fb = o.optJSONObject("promptFeedback");
+                throw new IOException(model + " gave no answer" + (fb != null ? " (" + fb.optString("blockReason") + ")" : ""));
+            }
+            JSONObject cand = cands.getJSONObject(0);
+            JSONObject cont = cand.optJSONObject("content");
+            JSONArray parts = cont == null ? null : cont.optJSONArray("parts");
             StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < parts.length(); i++) {
-                JSONObject p = parts.getJSONObject(i);
-                if (p.optBoolean("thought")) continue;
-                sb.append(p.optString("text"));
+            if (parts != null) {
+                for (int i = 0; i < parts.length(); i++) {
+                    JSONObject p = parts.getJSONObject(i);
+                    if (p.optBoolean("thought")) continue;
+                    sb.append(p.optString("text"));
+                }
+            }
+            if (sb.toString().trim().isEmpty()) {
+                throw new IOException(model + " returned an empty answer (" + cand.optString("finishReason", "unknown") + ")");
             }
             return sb.toString();
         } catch (JSONException e) {
-            throw new IOException(e);
+            throw new IOException("Couldn't read Gemini's reply: " + e.getMessage());
+        }
+    }
+
+    private static String errorMessage(String resp) {
+        try {
+            String m = new JSONObject(resp).getJSONObject("error").optString("message", resp);
+            return m.length() > 140 ? m.substring(0, 140) + "…" : m;
+        } catch (JSONException e) {
+            return resp.length() > 140 ? resp.substring(0, 140) : resp;
         }
     }
 

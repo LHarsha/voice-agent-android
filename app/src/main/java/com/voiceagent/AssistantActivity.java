@@ -469,11 +469,13 @@ public class AssistantActivity extends Activity implements Brain.Host {
                 String sayText = r.optString("say", "").trim();
                 msg = "Smart mode is on. " + (sayText.isEmpty() ? "" : sayText);
             } catch (Gemini.KeyException e) {
-                msg = "That key didn't work. Copy it again from Google AI Studio and paste the whole key.";
+                msg = "That key didn't work. " + e.getMessage();
             } catch (Gemini.RateLimitException e) {
                 msg = "The key works, but the free limit is used up for now. Try again in a minute.";
+            } catch (java.net.UnknownHostException | java.net.SocketTimeoutException | java.net.ConnectException e) {
+                msg = "I couldn't connect to Google. Check that the phone is online, then try again.";
             } catch (Exception e) {
-                msg = "I couldn't reach Gemini. Check your internet connection. (" + e.getMessage() + ")";
+                msg = "Smart mode isn't working yet. Google said: " + e.getMessage();
             }
             String m = msg;
             runOnUi(() -> say(m));
